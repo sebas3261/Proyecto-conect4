@@ -1,2 +1,23 @@
 versus/*
 !versus/.gitkeep
+# --- evitar archivos compilados ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- evitar entornos virtuales ---
+venv/
+env/
+.venv/
+
+# --- evitar archivos de VSCode ---
+.vscode/
+
+# --- evitar archivos del sistema ---
+.DS_Store
+Thumbs.db
+
+# --- evitar carpetas de logs ---
+logs/
+*.log
+
