@@ -7,15 +7,10 @@ class nowtosaySorry(Policy):
 
     @override
     def mount(self) -> None:
-        rng = np.random.default_rng()
-        self.fixed_col = int(rng.integers(0, 7)) 
+        pass
 
     @override
     def act(self, s: np.ndarray) -> int:
-        if s[0, self.fixed_col] == 0:
-            return self.fixed_col
-
-        # Si está llena, elegir cualquier columna válida
+        rng = np.random.default_rng()
         available_cols = [c for c in range(7) if s[0, c] == 0]
-        self.fixed_col = int(np.random.choice(available_cols))
-        return self.fixed_col
+        return int(rng.choice(available_cols))
