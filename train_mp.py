@@ -1,5 +1,6 @@
 # ============================================================
 #  TRAIN_MP.PY — MULTICORE TRAINING + PROMEDIO Q + LOGGING CSV
+#  Ahora con --max-workers para evitar que tu PC muera
 # ============================================================
 
 import argparse
@@ -7,6 +8,7 @@ import multiprocessing
 import numpy as np
 import os
 import csv
+import psutil
 from collections import Counter
 
 multiprocessing.freeze_support()
@@ -16,22 +18,16 @@ from connect4.utils import find_importable_classes
 from connect4.connect_state import ConnectState
 
 
-# ------------------------------------------------------------
-# Partida entre dos policies (1 vs -1)
-# ------------------------------------------------------------
+# ============================================================
+#      PARTIDA ENTRE DOS POLÍTICAS
+# ============================================================
 def play_single_game(name_plus, pol_plus, name_minus, pol_minus, rng) -> tuple:
-    """Devuelve:
-    winner (1 / -1 / 0),
-    total_moves,
-    first_player (name_plus o name_minus)
-    """
-
     pol_plus.mount()
     pol_minus.mount()
 
     state = ConnectState()
     moves = 0
-    first_player = name_plus  # inicialmente quien usa +1
+    first_player = name_plus
 
     while not state.is_final():
         board = state.board.copy()
@@ -46,7 +42,6 @@ def play_single_game(name_plus, pol_plus, name_minus, pol_minus, rng) -> tuple:
 
     winner = state.get_winner()
 
-    # Recompensas
     if winner == 1:
         pol_plus.final(+1)
         pol_minus.final(-1)
@@ -60,10 +55,10 @@ def play_single_game(name_plus, pol_plus, name_minus, pol_minus, rng) -> tuple:
     return winner, moves, first_player
 
 
-# ------------------------------------------------------------
-# Torneo knockout (1 campeón por worker)
-# ------------------------------------------------------------
-def knockout_tournament(players: dict[str, Policy], rng) -> str:
+# ============================================================
+#                 TORNEO POR WORKER
+# ============================================================
+def knockout_tournament(players, rng):
     names = list(players.keys())
     rng.shuffle(names)
 
@@ -77,7 +72,6 @@ def knockout_tournament(players: dict[str, Policy], rng) -> str:
             a, b = names[i], names[i + 1]
             pa, pb = players[a], players[b]
 
-            # aleatorio quién empieza
             if rng.random() < 0.5:
                 w, _, _ = play_single_game(a, pa, b, pb, rng)
                 nxt.append(a if w == 1 else b)
@@ -90,27 +84,23 @@ def knockout_tournament(players: dict[str, Policy], rng) -> str:
     return names[0]
 
 
-# ------------------------------------------------------------
-# Worker: ENTRENAMIENTO + LOGGING + Q-values
-# ------------------------------------------------------------
+# ============================================================
+#             WORKER DE ENTRENAMIENTO
+# ============================================================
 def worker_train(args):
     shuffle, seed, games_per_run, worker_id = args
     rng = np.random.default_rng(seed)
 
-    # cargar policies por grupo
     participants = find_importable_classes("groups", Policy)
-    player_names = list(sorted(participants.keys()))
+    player_names = sorted(participants.keys())
     players = {name: cls() for name, cls in participants.items()}
 
-    # LOG LOCAL DEL WORKER
     local_logs = []
 
-    # entrenamiento aleatorio
     for _ in range(games_per_run):
         a, b = rng.choice(player_names, size=2, replace=False)
         pa, pb = players[a], players[b]
 
-        # quién empieza
         if rng.random() < 0.5:
             winner, moves, fp = play_single_game(a, pa, b, pb, rng)
             fp_name = a
@@ -118,7 +108,6 @@ def worker_train(args):
             winner, moves, fp = play_single_game(b, pb, a, pa, rng)
             fp_name = b
 
-        # traducir ganador
         if winner == 1:
             win_name = fp_name
         elif winner == -1:
@@ -126,7 +115,6 @@ def worker_train(args):
         else:
             win_name = "draw"
 
-        # guardar fila
         local_logs.append({
             "worker": worker_id,
             "seed": seed,
@@ -137,10 +125,8 @@ def worker_train(args):
             "moves": moves
         })
 
-    # torneo final del worker
     champion = knockout_tournament(players, rng)
 
-    # Q-values aprendidos
     q_out = {}
     for name, p in players.items():
         if hasattr(p, "Q"):
@@ -149,21 +135,21 @@ def worker_train(args):
     return champion, q_out, local_logs
 
 
-# ------------------------------------------------------------
-# Fusionar Q PROMEDIO
-# ------------------------------------------------------------
+# ============================================================
+#         FUSIÓN PROMEDIO DE Q-VALUES
+# ============================================================
 def merge_qvalues(all_q_out):
     merged = {}
     counts = {}
 
-    for w in all_q_out:
-        for group, qdict in w.items():
+    for worker_q in all_q_out:
+        for group, qdict in worker_q.items():
             if group not in merged:
                 merged[group] = {}
                 counts[group] = {}
 
             for key, val in qdict.items():
-                merged[group][key] = merged[group].get(key, 0.0) + val
+                merged[group][key] = merged[group].get(key, 0.0) + float(val)
                 counts[group][key] = counts[group].get(key, 0) + 1
 
     final_q = {}
@@ -173,15 +159,15 @@ def merge_qvalues(all_q_out):
     return final_q
 
 
-# ------------------------------------------------------------
-# Guardar Q-values finales en cada policy
-# ------------------------------------------------------------
+# ============================================================
+#           GUARDAR Q POR POLÍTICA ORIGINAL
+# ============================================================
 def save_merged_qvalues(final_q):
     participants = find_importable_classes("groups", Policy)
-
     for name, cls in participants.items():
         if name not in final_q:
             continue
+
         p = cls()
         if hasattr(p, "Q") and hasattr(p, "_save_qvalues"):
             p.Q = final_q[name]
@@ -190,30 +176,44 @@ def save_merged_qvalues(final_q):
     print("🔥 Q-values guardados correctamente.")
 
 
-# ------------------------------------------------------------
-# Entrenamiento MULTICORE
-# ------------------------------------------------------------
-def run_training_parallel(runs, shuffle, seed, games_per_run):
+# ============================================================
+#                       MONITOREAR RAM
+# ============================================================
+def check_ram_limit():
+    ram_used = psutil.virtual_memory().percent
+    if ram_used > 90:
+        print("\n⚠️ ADVERTENCIA: RAM arriba de 90% → reduciendo workers.\n")
+    return ram_used
+
+
+# ============================================================
+#                   MULTICORE TRAINING
+# ============================================================
+def run_training_parallel(runs, shuffle, seed, games_per_run, max_workers):
     jobs = [(shuffle, seed + i, games_per_run, i) for i in range(runs)]
 
-    ncpu = multiprocessing.cpu_count()
-    print(f"🧵 Usando {ncpu} núcleos para {runs} jobs…")
+    ncpu = min(max_workers, multiprocessing.cpu_count())
+    print(f"🧵 Usando {ncpu} workers (máximo permitido: {max_workers})\n")
 
     champions = []
     all_q = []
     all_logs = []
 
     with multiprocessing.Pool(ncpu) as pool:
-        for champion, q_out, logs in pool.imap_unordered(worker_train, jobs):
+        for result in pool.imap_unordered(worker_train, jobs):
+            champion, q_out, logs = result
+
             champions.append(champion)
             all_q.append(q_out)
             all_logs.extend(logs)
 
-    # Mezclar Q
+            if check_ram_limit() > 95:
+                print("❌ RAM CRÍTICA → Entrenamiento detenido.")
+                break
+
     final_q = merge_qvalues(all_q)
     save_merged_qvalues(final_q)
 
-    # ---- GUARDAR LOGS CSV ----
     os.makedirs("logs", exist_ok=True)
     csv_path = "logs/training_results.csv"
 
@@ -227,16 +227,19 @@ def run_training_parallel(runs, shuffle, seed, games_per_run):
     return champions
 
 
-# ------------------------------------------------------------
+# ============================================================
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=20)
+    parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--games-per-run", type=int, default=200)
+    parser.add_argument("--max-workers", type=int, default=6,
+                        help="NÚMERO MÁXIMO DE PROCESOS simultáneos.")
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=911)
     return parser.parse_args()
 
 
+# ============================================================
 if __name__ == "__main__":
     args = parse_args()
 
@@ -244,11 +247,11 @@ if __name__ == "__main__":
         runs=args.runs,
         shuffle=args.shuffle,
         seed=args.seed,
-        games_per_run=args.games_per_run
+        games_per_run=args.games_per_run,
+        max_workers=args.max_workers,
     )
 
     print("\n=== TRAINING FINISHED ===")
-    print("Campeones por worker:")
     counter = Counter(champs)
     for name, cnt in counter.most_common():
         print(f"  {name}: {cnt}")
