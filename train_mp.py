@@ -1,240 +1,174 @@
 # ============================================================
-#  TRAIN_MP.PY — Entrenamiento MULTICORE con PROMEDIO de Q
+#   TRAIN_MP.PY — MULTICORE TRAINING + CSV LOGGING + Q-MERGE
 # ============================================================
 
 import argparse
-import multiprocessing
 import numpy as np
+import multiprocessing
+import json
 import os
-from collections import Counter, defaultdict
-
+import csv
+import time
 multiprocessing.freeze_support()
 
 from connect4.policy import Policy
 from connect4.utils import find_importable_classes
-from connect4.connect_state import ConnectState
+from tournament import make_initial_matches, pair_next_round, play
 
 
 # ------------------------------------------------------------
-# Partida entre dos políticas (1 vs -1)
+# Ejecuta un torneo completo en un proceso
 # ------------------------------------------------------------
-def play_single_game(name_plus, pol_plus, name_minus, pol_minus, rng) -> int:
-    """Juega UNA partida entre dos policies ya instanciadas.
-    Devuelve winner ∈ {1, -1, 0} desde la perspectiva del tablero (+1 / -1 / empate).
-    """
+def fast_run_tournament(args):
+    players, shuffle, seed, worker_id = args
 
-    # Reiniciar memoria interna por partida
-    pol_plus.mount()
-    pol_minus.mount()
+    rng = np.random.default_rng(seed)
+    versus = make_initial_matches(players, shuffle, rng)
 
-    state = ConnectState()
+    # Log por run
+    log = {
+        "run": worker_id,
+        "seed": seed,
+        "winner": None,
+        "loser": None,
+        "winner_policy": None,
+        "loser_policy": None,
+        "total_moves": 0,
+        "duration": 0.0,
+        "first_player": None,
+        "fp_advantage": None,
+        "exploration_rate": None,
+        "reward": None,
+        "win_type": None,
+    }
 
-    while not state.is_final():
-        # Usamos una copia para no mutar el tablero real en _normalize
-        board = state.board.copy()
+    start_time = time.time()
 
-        if state.player == 1:
-            action = pol_plus.act(board)
-        else:
-            action = pol_minus.act(board)
-
-        state = state.transition(int(action))
-
-    winner = state.get_winner()
-
-    # Recompensas por jugador
-    if winner == 1:
-        pol_plus.final(+1)
-        pol_minus.final(-1)
-    elif winner == -1:
-        pol_plus.final(-1)
-        pol_minus.final(+1)
-    else:
-        pol_plus.final(0)
-        pol_minus.final(0)
-
-    return winner
-
-
-# ------------------------------------------------------------
-# Torneo knockout sencillo para "medir campeón" del worker
-# ------------------------------------------------------------
-def knockout_tournament(players: dict[str, Policy], rng) -> str:
-    """Devuelve el nombre del campeón usando un bracket simple."""
-    names = list(players.keys())
-    rng.shuffle(names)
-
-    while len(names) > 1:
-        next_round = []
-        for i in range(0, len(names), 2):
-            if i + 1 == len(names):
-                next_round.append(names[i])
+    while True:
+        winners = []
+        for a, b in versus:
+            if a is None:
+                winners.append(b)
+                continue
+            if b is None:
+                winners.append(a)
                 continue
 
-            a = names[i]
-            b = names[i + 1]
-            pol_a = players[a]
-            pol_b = players[b]
+            # PARTIDA ÚNICA (best-of = 1 para máximo rendimiento)
+            result = play(a, b, best_of=1, first_player_distribution=0.5, seed=seed)
 
-            # Tiramos moneda para ver quién juega como +1
-            if rng.random() < 0.5:
-                w = play_single_game(a, pol_a, b, pol_b, rng)
-                if w == 1:
-                    next_round.append(a)
-                elif w == -1:
-                    next_round.append(b)
-                else:
-                    next_round.append(rng.choice([a, b]))
-            else:
-                w = play_single_game(b, pol_b, a, pol_a, rng)
-                if w == 1:
-                    next_round.append(b)
-                elif w == -1:
-                    next_round.append(a)
-                else:
-                    next_round.append(rng.choice([a, b]))
+            if result is None:
+                continue
 
-        names = next_round
+            winner_name, loser_name, match_data = result
 
-    return names[0]
+            winners.append((winner_name, players_dict[winner_name]))
 
+            # ---- Guardar información del match ----
+            log["winner"] = winner_name
+            log["loser"] = loser_name
+            log["winner_policy"] = players_dict[winner_name].__name__
+            log["loser_policy"] = players_dict[loser_name].__name__
+            log["total_moves"] = match_data["moves"]
+            log["first_player"] = match_data["first_player"]
+            log["fp_advantage"] = 1 if match_data["first_player"] == winner_name else 0
+            log["reward"] = match_data["reward"]
+            log["win_type"] = match_data["result"]
 
-# ------------------------------------------------------------
-# Worker: entrena varias partidas y devuelve Q por grupo
-# ------------------------------------------------------------
-def worker_train(args):
-    shuffle, seed, games_per_run = args
-    rng = np.random.default_rng(seed)
+        if len(winners) == 1:
+            log["winner"] = winners[0][0]
+            break
 
-    # Cada worker descubre sus grupos y crea UNA instancia por grupo
-    participants = find_importable_classes("groups", Policy)  # {name: class}
-    player_names = sorted(participants.keys())
+        versus = pair_next_round(winners)
 
-    # Instancias persistentes dentro del worker
-    players = {name: cls() for name, cls in participants.items()}
+    end_time = time.time()
+    log["duration"] = round(end_time - start_time, 5)
 
-    # Jugar muchas partidas aleatorias entre grupos
-    n_players = len(player_names)
-    if n_players < 2:
-        raise RuntimeError("Se necesitan al menos 2 grupos para entrenar.")
+    # Guardar Q-values del worker
+    q_out = {}
+    for name, cls in players:
+        try:
+            p = cls()
+            if hasattr(p, "Q"):
+                q_out[name] = p.Q
+        except:
+            pass
 
-    for _ in range(games_per_run):
-        # Elegimos dos grupos distintos al azar
-        i, j = rng.choice(n_players, size=2, replace=False)
-        name_a = player_names[i]
-        name_b = player_names[j]
-        pol_a = players[name_a]
-        pol_b = players[name_b]
+    with open(f"qvalues_worker_{worker_id}.json", "w") as f:
+        json.dump(q_out, f)
 
-        # Aleatorio quién es +1 y quién -1
-        if rng.random() < 0.5:
-            play_single_game(name_a, pol_a, name_b, pol_b, rng)
-        else:
-            play_single_game(name_b, pol_b, name_a, pol_a, rng)
-
-    # Torneo de evaluación para saber "campeón" de este worker
-    champion_name = knockout_tournament(players, rng)
-
-    # Extraer Q-values de cada policy que tenga atributo Q
-    q_out: dict[str, dict] = {}
-    for name, pol in players.items():
-        if hasattr(pol, "Q"):
-            q_out[name] = dict(pol.Q)  # copia ligera
-
-    return champion_name, q_out
+    return log
 
 
 # ------------------------------------------------------------
-# Fusionar Q-values de TODOS los workers usando PROMEDIO
+# Fusionar Q-values de todos los workers
 # ------------------------------------------------------------
-def merge_qvalues(all_q_out: list[dict[str, dict]]) -> dict[str, dict]:
-    """
-    all_q_out: lista (por worker) de dict[group_name -> {key -> q}]
-    Devuelve dict[group_name -> {key -> q_promedio}]
-    """
-    sum_q: dict[str, dict] = {}
-    count_q: dict[str, dict] = {}
+def merge_qvalues(num_workers):
+    merged = {}
 
-    for worker_q in all_q_out:
-        for group, qdict in worker_q.items():
-            g_sum = sum_q.setdefault(group, {})
-            g_cnt = count_q.setdefault(group, {})
+    for i in range(num_workers):
+        path = f"qvalues_worker_{i}.json"
+        if not os.path.exists(path):
+            continue
+
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        for group, qdict in data.items():
+            if group not in merged:
+                merged[group] = {}
+
             for key, val in qdict.items():
-                g_sum[key] = g_sum.get(key, 0.0) + float(val)
-                g_cnt[key] = g_cnt.get(key, 0) + 1
+                if key not in merged[group]:
+                    merged[group][key] = val
+                else:
+                    merged[group][key] = (merged[group][key] + val) / 2
 
-    final_q: dict[str, dict] = {}
-    for group, g_sum in sum_q.items():
-        g_cnt = count_q[group]
-        final_q[group] = {k: g_sum[k] / g_cnt[k] for k in g_sum.keys()}
+    with open("qvalues_final.json", "w") as f:
+        json.dump(merged, f, indent=2)
 
-    return final_q
+    print("🔥 Q-values fusionados → qvalues_final.json")
 
 
 # ------------------------------------------------------------
-# Guardar Q promedio en los archivos propios de cada policy
+# Training en paralelo
 # ------------------------------------------------------------
-def save_merged_qvalues(final_q: dict[str, dict]):
-    """
-    final_q: dict[group_name -> {key -> q}]
-    Usa las propias policies para saber dónde guardar su JSON.
-    """
+def run_training_parallel(runs, shuffle, seed):
+    global players_dict
+
     participants = find_importable_classes("groups", Policy)
+    players = list(participants.items())
+    players_dict = {name: cls for name, cls in players}
 
-    for name, cls in participants.items():
-        if name not in final_q:
-            continue
-
-        pol = cls()
-        if not hasattr(pol, "Q") or not hasattr(pol, "_save_qvalues"):
-            continue
-
-        pol.Q = final_q[name]
-        pol._save_qvalues()
-
-    print("\n🔥 Q-values promediados guardados en los JSON de cada grupo (B, C, D, ...)")
-
-
-# ------------------------------------------------------------
-# Entrenamiento paralelo de alto nivel
-# ------------------------------------------------------------
-def run_training_parallel(runs: int, shuffle: bool, seed: int, games_per_run: int):
-    """
-    runs          = cuántos 'jobs' lanzar (cada uno con games_per_run partidas)
-    games_per_run = cuántas partidas juega cada worker
-    """
-    jobs = [(shuffle, seed + i, games_per_run) for i in range(runs)]
+    jobs = [(players, shuffle, seed + i, i) for i in range(runs)]
 
     ncpu = multiprocessing.cpu_count()
-    print(f"🧵 Usando hasta {ncpu} núcleos para {runs} jobs...")
-    print(f"   Cada job juega {games_per_run} partidas aleatorias entre grupos.\n")
-
-    champions: list[str] = []
-    all_q_out: list[dict[str, dict]] = []
+    print(f"🧵 Usando {ncpu} núcleos para {runs} torneos...")
 
     with multiprocessing.Pool(ncpu) as pool:
-        for champion_name, q_out in pool.imap_unordered(worker_train, jobs):
-            champions.append(champion_name)
-            all_q_out.append(q_out)
+        logs = pool.map(fast_run_tournament, jobs)
 
-    # Fusionar Q-values de todos los workers
-    final_q = merge_qvalues(all_q_out)
-    save_merged_qvalues(final_q)
+    # Guardar CSV
+    os.makedirs("logs", exist_ok=True)
+    csv_path = "logs/training_results.csv"
 
-    return champions
+    write_header = not os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=logs[0].keys())
+        if write_header:
+            writer.writeheader()
+        writer.writerows(logs)
+
+    merge_qvalues(runs)
+
+    return logs
 
 
-# ------------------------------------------------------------
-# CLI
 # ------------------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Entrenamiento Connect4 MULTICORE con promedio de Q-values."
-    )
-    parser.add_argument("--runs", type=int, default=50,
-                        help="Número de jobs (workers lógicos) a lanzar.")
-    parser.add_argument("--games-per-run", type=int, default=200,
-                        help="Partidas que juega cada job entre grupos.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runs", type=int, default=100)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=911)
     return parser.parse_args()
@@ -242,19 +176,8 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    logs = run_training_parallel(args.runs, args.shuffle, args.seed)
 
-    champions = run_training_parallel(
-        runs=args.runs,
-        shuffle=args.shuffle,
-        seed=args.seed,
-        games_per_run=args.games_per_run,
-    )
-
-    # Estadísticas de campeones por job
-    counter = Counter(champions)
-
-    print("\n=== TRAINING FINISHED (MULTICORE + PROMEDIO) ===")
-    print(f"Jobs ejecutados: {args.runs}")
-    print("Frecuencia de campeones por job:")
-    for name, cnt in counter.most_common():
-        print(f"  {name}: {cnt}")
+    print("\n=== TRAINING FINISHED ===")
+    print("Logs CSV guardados en logs/training_results.csv")
+    print("Q-values guardados en qvalues_final.json")
