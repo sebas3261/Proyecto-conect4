@@ -8,9 +8,10 @@ if __name__ == "__main__":
     t0 = time.time()
 
     champions = train_mp.run_training_parallel(
-        runs=50,
+        runs=500,
         shuffle=True,
         seed=911,
+        games_per_run= 500
     )
 
     t1 = time.time()
