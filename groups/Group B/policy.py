@@ -6,73 +6,79 @@ from connect4.policy import Policy
 
 
 class UncertaintyWithEGreedy(Policy):
+    """
+    Policy B: e-greedy con Q-learning.
+    Versión arreglada: bootstrapping completo + guardado en cada paso.
+    """
 
-    # =========================================================
-    #           INICIALIZACIÓN SEGURA (autograder-proof)
-    # =========================================================
     def __init__(self):
-        # El autograder puede NO llamar mount(), así que todo va aquí.
-        self.Q = {}
-        self.memory = []
-        self.epsilon = 0.01   # exploración mínima para no fallar 95%
-        self.alpha = 0.2
+        self.Q: dict[str, float] = {}
+        self.memory: list[tuple[str, int]] = []
+
+        # Hiperparámetros
+        self.epsilon: float = 0.01   # exploración mínima
+        self.alpha: float = 0.2
         self.time_out = None
 
         self._load_qvalues()
 
-    # =========================================================
-    # MOUNT — opcional para el autograder
-    # =========================================================
-    def mount(self, time_out: int | None = 5) -> None:
-        # El autograder pasa time_out; toleramos que sea None.
+    def mount(self, time_out=None):
         self.time_out = max(1, int(time_out)) if time_out is not None else None
 
     # =========================================================
-    # ACT — EXACTAMENTE tu lógica e-greedy + Q-learning
+    # ACT — e-greedy + bootstrapping completo + auto-save
     # =========================================================
     def act(self, s: np.ndarray) -> int:
-        # Copia del tablero para no alterar el original
         s = s.copy()
         self._normalize(s)
 
         state_key = self._state_key(s)
-
-        # Columnas disponibles
         available_cols = [c for c in range(7) if s[0, c] == 0]
+
+        if not available_cols:
+            return 0  # seguridad
 
         rng = np.random.default_rng()
 
-        # --- Epsilon-greedy (tu lógica EXACTA) ---
+        # 🔥 BOOTSTRAP Q(s,a) PARA TODAS LAS ACCIONES POSIBLES
+        for a in available_cols:
+            key = f"{state_key}|{a}"
+            if key not in self.Q:
+                self.Q[key] = 0.0
+
+        # --- Epsilon-greedy ---
         if rng.random() < self.epsilon:
             action = int(rng.choice(available_cols))
         else:
             action = self._exploit(state_key, available_cols)
 
-        # Guardar transición para actualización posterior
+        # Registrar transición
         self.memory.append((state_key, action))
+
+        # 🔥 GUARDAR INMEDIATAMENTE (como UCB1)
+        self._save_qvalues()
 
         return action
 
     # =========================================================
-    # EXPLOIT — 100% como tu versión original
+    # EXPLOIT — elegir mejor acción según Q
     # =========================================================
-    def _exploit(self, state_key, available_cols):
+    def _exploit(self, state_key: str, available_cols: list[int]) -> int:
         best_q = -1e9
         best_action = available_cols[0]
 
-        for c in available_cols:
-            q = self.Q.get(f"{state_key}|{c}", 0.0)
+        for a in available_cols:
+            q = self.Q.get(f"{state_key}|{a}", 0.0)
             if q > best_q:
                 best_q = q
-                best_action = c
+                best_action = a
 
         return best_action
 
     # =========================================================
-    # FINAL — Q-learning EXACTO y seguro
+    # FINAL — Q-learning + auto-save
     # =========================================================
-    def final(self, reward):
-        # Si no hubo jugadas, no actualizamos ni guardamos
+    def final(self, reward: float):
         if not self.memory:
             return
 
@@ -83,25 +89,22 @@ class UncertaintyWithEGreedy(Policy):
             self.Q[key] = new_q
 
         self.memory = []
+
+        # 🔥 GUARDAR SIEMPRE
         self._save_qvalues()
 
     # =========================================================
-    # NORMALIZACIÓN ROBUSTA (sin heurísticas)
+    # NORMALIZACIÓN
     # =========================================================
     def _normalize(self, s):
         ones = np.sum(s == 1)
         negs = np.sum(s == -1)
 
-        # Si ambos han puesto el mismo número de fichas → turno de +1
         if ones == negs:
             return
-
-        # Si -1 ha puesto una ficha más → turno de -1 (invertir)
         if negs == ones + 1:
             s[:] = -s
             return
-
-        # Si el autograder produce estados irregulares → corregir
         if negs > ones:
             s[:] = -s
 
@@ -111,50 +114,40 @@ class UncertaintyWithEGreedy(Policy):
     def _state_key(self, s):
         return ",".join(map(str, s.reshape(-1)))
 
-    # PATH del archivo JSON
     def _json_path(self):
         return os.path.join(os.path.dirname(__file__), "qvalues.json")
 
     # =========================================================
-    # LOAD 100% ROBUSTO — nunca crashea, nunca borra por accidente
+    # LOAD robusto
     # =========================================================
     def _load_qvalues(self):
         path = self._json_path()
-
         if not os.path.exists(path):
             self.Q = {}
             return
 
         try:
             with open(path, "r") as f:
-                data = f.read().strip()
+                text = f.read().strip()
 
-            # JSON vacío o truncado → reset
-            if not data or not data.endswith("}"):
+            if not text:
                 self.Q = {}
                 return
 
-            self.Q = json.loads(data)
-
+            self.Q = json.loads(text)
         except Exception:
-            # Archivo corrupto → empezar limpio sin borrar archivo
             self.Q = {}
 
     # =========================================================
-    # SAVE ATÓMICO — imposible truncar o corromper el JSON
+    # SAVE atómico — SIEMPRE GUARDA
     # =========================================================
     def _save_qvalues(self):
-        # Evita sobrescribir con Q vacío → NO borrar archivo por accidente
-        if len(self.Q) == 0:
-            return
-
         path = self._json_path()
         dirpath = os.path.dirname(path)
+        os.makedirs(dirpath, exist_ok=True)
 
-        # 1. Crear archivo temporal
         fd, tmp_path = tempfile.mkstemp(dir=dirpath)
         with os.fdopen(fd, "w") as f:
             json.dump(self.Q, f)
 
-        # 2. Reemplazo atómico (renombrar)
         os.replace(tmp_path, path)
