@@ -1,120 +1,153 @@
-# Abstract
 from connect4.environment_state import EnvironmentState
-
-# Types
-from typing import Any
-
-# Libraries
 import numpy as np
-import matplotlib.pyplot as plt
+from typing import List
 
 
 class ConnectState(EnvironmentState):
     ROWS = 6
     COLS = 7
 
+    # (LINES se llenará después de la clase)
+
+    # ------------------------------------------------------
     def __init__(self, board: np.ndarray | None = None, player: int = -1):
         if board is None:
-            self.board = np.zeros((self.ROWS, self.COLS), dtype=int)
+            self.board = np.zeros((self.ROWS, self.COLS), dtype=np.int8)
         else:
-            self.board = board.copy()
-        self.player = player  # -1 = Red, 1 = Yellow type: ignore
+            self.board = board.astype(np.int8)
 
-    def is_final(self) -> bool:
-        return self.get_winner() != 0 or not any(self.board[0] == 0)
+        self.player = int(player)
 
-    def is_applicable(self, event: Any) -> bool:
-        return (
-            isinstance(event, int)
-            and 0 <= event < self.COLS
-            and self.is_col_free(event)
-            and not self.is_final()
-        )
+        # Alturas O(1)
+        self.heights = np.zeros(self.COLS, dtype=np.int8)
+        for c in range(self.COLS):
+            col = self.board[:, c]
+            nz = np.nonzero(col)[0]
+            if nz.size == 0:
+                self.heights[c] = 0
+            else:
+                self.heights[c] = self.ROWS - nz[0]
 
-    def get_winner(self) -> int:
-        # Check all 4 directions
-        for r in range(self.ROWS):
-            for c in range(self.COLS):
-                player = self.board[r, c]
-                if player == 0:
-                    continue
+        # Espacios libres
+        self.empty_count = int(np.count_nonzero(self.board == 0))
 
-                # Right
-                if c + 3 < self.COLS and all(
-                    self.board[r, c + i] == player for i in range(4)
-                ):
-                    return player
-                # Down
-                if r + 3 < self.ROWS and all(
-                    self.board[r + i, c] == player for i in range(4)
-                ):
-                    return player
-                # Diagonal right-down
-                if (
-                    r + 3 < self.ROWS
-                    and c + 3 < self.COLS
-                    and all(self.board[r + i, c + i] == player for i in range(4))
-                ):
-                    return player
-                # Diagonal left-down
-                if (
-                    r + 3 < self.ROWS
-                    and c - 3 >= 0
-                    and all(self.board[r + i, c - i] == player for i in range(4))
-                ):
-                    return player
+        # Cache del ganador
+        self._winner = 0
+
+    # ------------------------------------------------------
+    def _check_after_move(self, row: int, col: int) -> int:
+        player = self.board[row, col]
+        dirs = [(0, 1), (1, 0), (1, 1), (1, -1)]
+
+        r = c = 0  # evita warnings
+
+        for dr, dc in dirs:
+            count = 1
+
+            # forward
+            r, c = row + dr, col + dc
+            while (
+                0 <= r < self.ROWS and
+                0 <= c < self.COLS and
+                self.board[r, c] == player
+            ):
+                count += 1
+                r += dr
+                c += dc
+
+            # backward
+            r, c = row - dr, col - dc
+            while (
+                0 <= r < self.ROWS and
+                0 <= c < self.COLS and
+                self.board[r, c] == player
+            ):
+                count += 1
+                r -= dr
+                c -= dc
+
+            if count >= 4:
+                return player
 
         return 0
 
-    def is_col_free(self, col: int) -> bool:
-        return self.board[0, col] == 0
+    # ------------------------------------------------------
+    def transition_fast(self, col: int):
+        if self.board[0, col] != 0:
+            raise ValueError(f"Column {col} is full.")
 
-    def get_heights(self) -> list[int]:
-        heights = []
-        for c in range(self.COLS):
-            col = self.board[:, c]
-            for r in range(self.ROWS):
-                if col[r] != 0:
-                    heights.append(self.ROWS - r)
-                    break
-            else:
-                heights.append(0)
-        return heights
+        h = self.heights[col]
+        row = self.ROWS - 1 - h
 
-    def get_free_cols(self) -> list[int]:
-        return [c for c in range(self.COLS) if self.is_col_free(c)]
+        self.board[row, col] = self.player
+        self.heights[col] += 1
+        self.empty_count -= 1
 
-    def transition(self, col: int) -> "ConnectState":
-        if not self.is_applicable(col):
-            raise ValueError(f"Move not allowed in column {col}.")
+        self._winner = self._check_after_move(row, col)
 
-        new_board = self.board.copy()
-        for r in reversed(range(self.ROWS)):
-            if new_board[r, col] == 0:
-                new_board[r, col] = self.player
-                break
+        self.player = -self.player
+        return self
 
-        return ConnectState(new_board, -self.player)
+    # ------------------------------------------------------
+    def transition(self, col: int):
+        new = ConnectState(self.board.copy(), self.player)
+        return new.transition_fast(col)
 
-    def show(self, size: int = 1500, ax: plt.Axes | None = None) -> None:
-        if ax is None:
-            fig, ax = plt.subplots()
-        else:
-            fig = None
+    # ------------------------------------------------------
+    def is_final(self) -> bool:
+        return self._winner != 0 or self.empty_count == 0
 
-        pos_red = np.where(self.board == -1)
-        pos_yellow = np.where(self.board == 1)
+    def get_winner(self) -> int:
+        return self._winner
 
-        ax.scatter(pos_yellow[1] + 0.5, 5.5 - pos_yellow[0], color="yellow", s=size)
-        ax.scatter(pos_red[1] + 0.5, 5.5 - pos_red[0], color="red", s=size)
+    # ------------------------------------------------------
+    def is_applicable(self, col: int) -> bool:
+        return (
+            0 <= col < self.COLS
+            and self.board[0, col] == 0
+            and not self.is_final()
+        )
 
-        ax.set_ylim([0, self.board.shape[0]])
-        ax.set_xlim([0, self.board.shape[1]])
-        ax.set_xticks(np.arange(self.board.shape[1] + 1))
-        ax.set_yticks(np.arange(self.board.shape[0] + 1))
-        ax.grid(True)
+    # ------------------------------------------------------
+    def get_free_cols(self) -> List[int]:
+        return np.flatnonzero(self.board[0] == 0).tolist()
 
-        ax.set_title("Connect Four")
+    # ------------------------------------------------------
+    def get_heights(self) -> List[int]:
+        return self.heights.tolist()
 
-        if fig is not None:
-            plt.show()
+
+
+# ------------------------------------------------------
+# PRECÁLCULO FINAL DE LÍNEAS GANADORAS (FUERA DE LA CLASE)
+# ------------------------------------------------------
+
+def _compute_lines():
+    lines = []
+    ROWS = ConnectState.ROWS
+    COLS = ConnectState.COLS
+
+    for r in range(ROWS):
+        for c in range(COLS):
+
+            # Horizontal →
+            if c + 3 < COLS:
+                lines.append([(r, c + i) for i in range(4)])
+
+            # Vertical ↓
+            if r + 3 < ROWS:
+                lines.append([(r + i, c) for i in range(4)])
+
+            # Diagonal ↘
+            if r + 3 < ROWS and c + 3 < COLS:
+                lines.append([(r + i, c + i) for i in range(4)])
+
+            # Diagonal ↙
+            if r + 3 < ROWS and c - 3 >= 0:
+                lines.append([(r + i, c - i) for i in range(4)])
+
+    return np.array(lines, dtype=np.int8)
+
+
+# Asignar el resultado a la clase (ya existe aquí)
+ConnectState.LINES = _compute_lines()

@@ -3,14 +3,27 @@ from connect4.policy import Policy
 from typing import override
 
 
-class nowtosaySorry(Policy):
+class ItsAMi(Policy):
+    def __init__(self):
+        # RNG persistente (MUCHO más rápido)
+        self.rng = np.random.default_rng()
 
     @override
     def mount(self) -> None:
+        # no necesitas nada aquí
         pass
 
     @override
     def act(self, s: np.ndarray) -> int:
-        rng = np.random.default_rng()
-        available_cols = [c for c in range(7) if s[0, c] == 0]
-        return int(rng.choice(available_cols))
+        # 🔥 Vectorizado: encontrar columnas válidas rápido
+        available_cols = np.flatnonzero(s[0] == 0)
+
+        # Seguridad, aunque no debería pasar
+        if available_cols.size == 0:
+            return 0
+
+        # Elección aleatoria con RNG persistente
+        return int(self.rng.choice(available_cols))
+    
+    def final(self, reward: int) -> None:
+        pass

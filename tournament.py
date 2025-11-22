@@ -1,177 +1,130 @@
-import os
-from typing import Callable
+# ==============================================================
+#          TOURNAMENT.PY — MODO ULTRA TURBO (COPY/PASTE)
+# ==============================================================
+
 import numpy as np
-from connect4.dtos import Game, Match, Participant, Versus, State, Action
-from connect4.connect_state import ConnectState
 
 
-# ------------------------------------------------------------
-# Utilidades
-# ------------------------------------------------------------
-def next_power_of_two(n: int) -> int:
-    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+# ==============================================================
+# Emparejamientos iniciales (sin logging, ultra rápido)
+# ==============================================================
+def make_initial_matches(players, shuffle, rng):
+    players = players[:]  # copiar para no mutar
 
-
-def make_initial_matches(players: list[Participant], shuffle: bool, seed: int) -> Versus:
-    players = players[:]  # copy
     if shuffle:
-        rng = np.random.default_rng(seed)
         rng.shuffle(players)
 
-    size = next_power_of_two(len(players))
-    players += [None] * (size - len(players))  # BYEs
+    # siguiente potencia de 2
+    def next_pow2(n):
+        return 1 if n <= 1 else 1 << (n - 1).bit_length()
 
-    versus: Versus = []
-    for i in range(0, size, 2):
-        versus.append((players[i], players[i + 1]))
-    return versus
+    size = next_pow2(len(players))
+
+    # agregar BYEs (None)
+    players += [None] * (size - len(players))
+
+    return [(players[i], players[i + 1]) for i in range(0, size, 2)]
 
 
-def pair_next_round(winners: list[Participant]) -> Versus:
+# ==============================================================
+# Siguiente ronda
+# ==============================================================
+def pair_next_round(winners):
     return [(winners[i], winners[i + 1]) for i in range(0, len(winners), 2)]
 
 
-def play_round(
-    versus: Versus,
-    play: Callable[[Participant, Participant, int, float, int], Participant],
-    best_of: int,
-    first_player_distribution: float,
-    seed: int,
-) -> list[Participant]:
+# ==============================================================
+#        Versión ultra rápida de play()  — 1 partida
+# ==============================================================
 
-    winners: list[Participant] = []
+def play(a, b, seed=0):
+    """
+    Ultra-fast play function:
+    - 1 single game
+    - no JSON
+    - no Match/Game objects
+    - no Versus objects
+    - calls .final() for learning
+    - returns (name, policy_class) of the winner, or None
+    """
 
-    for a, b in versus:
-        if a is None and b is None:
-            raise ValueError("Invalid match: two BYEs")
-        if a is None:
-            winners.append(b)
-        elif b is None:
-            winners.append(a)
-        else:
-            winners.append(play(a, b, best_of, first_player_distribution, seed))
-
-    return winners
-
-
-# ------------------------------------------------------------
-# Jugar un MATCH (mejor de N)
-# ------------------------------------------------------------
-def play(
-    a: Participant,
-    b: Participant,
-    best_of: int,
-    first_player_distribution: float,
-    seed: int = 911,
-) -> Participant:
-
-    a_name, a_policy = a
-    b_name, b_policy = b
-
-    a_wins = 0
-    b_wins = 0
-    draws = 0
-    games_needed = (best_of // 2) + 1
+    from connect4.connect_state import ConnectState
 
     rng = np.random.default_rng(seed)
-    games: list[Game] = []
 
-    while a_wins < games_needed and b_wins < games_needed:
+    # Desempaquetar
+    a_name, a_class = a
+    b_name, b_class = b
 
-        # Elegir quién es +1 en esta partida
-        if rng.random() < first_player_distribution:
-            plus1_name, plus1 = a_name, a_policy()
-            minus1_name, minus1 = b_name, b_policy()
+    # Crear policies
+    a_pol = a_class()
+    b_pol = b_class()
+
+    # Montar
+    a_pol.mount()
+    b_pol.mount()
+
+    # Nuevo estado
+    state = ConnectState()
+
+    # Jugar hasta terminal
+    while not state.is_final():
+        board = state.board
+
+        if state.player == 1:
+            act = a_pol.act(board)
+            state = state.transition_fast(int(act))
         else:
-            plus1_name, plus1 = b_name, b_policy()
-            minus1_name, minus1 = a_name, a_policy()
+            act = b_pol.act(board)
+            state = state.transition_fast(int(act))
 
-        plus1.mount()
-        minus1.mount()
+    winner = state.get_winner()
 
-        state = ConnectState()
-        history: list[tuple[State, Action]] = []
-
-        while not state.is_final():
-            if state.player == 1:
-                action = plus1.act(state.board)
-            else:
-                action = minus1.act(state.board)
-
-            history.append((state.board.tolist(), int(action)))
-            state = state.transition(int(action))
-
-        # Guardar partida en formato nuevo
-        games.append(
-            Game(
-                player_plus1=plus1_name,
-                player_minus1=minus1_name,
-                history=history,
-            )
-        )
-
-        winner = state.get_winner()
-
-        if winner == 1:     # +1 ganó
-            if plus1_name == a_name:
-                a_wins += 1
-            else:
-                b_wins += 1
-
-        elif winner == -1:  # -1 ganó
-            if minus1_name == a_name:
-                a_wins += 1
-            else:
-                b_wins += 1
-
-        else:
-            draws += 1
-
-        if draws > games_needed + 5:
-            break
-
-    # ------------------------------------------------------------
-    # Guardar JSON (crear carpeta si no existe)
-    # ------------------------------------------------------------
-    os.makedirs("versus", exist_ok=True)
-
-    match = Match(
-        player_a=a_name,
-        player_b=b_name,
-        player_a_wins=a_wins,
-        player_b_wins=b_wins,
-        draws=draws,
-        games=games,
-    )
-
-    with open(f"versus/match_{a_name}_vs_{b_name}.json", "w") as f:
-        f.write(match.model_dump_json(indent=4))
-
-    return a if a_wins > b_wins else b
+    # Aprendizaje
+    if winner == 1:
+        a_pol.final(+1)
+        b_pol.final(-1)
+        return a
+    elif winner == -1:
+        a_pol.final(-1)
+        b_pol.final(+1)
+        return b
+    else:
+        a_pol.final(0)
+        b_pol.final(0)
+        return None
 
 
-# ------------------------------------------------------------
-# Torneo completo
-# ------------------------------------------------------------
-def run_tournament(
-    players: list[Participant],
-    play: Callable[[Participant, Participant], Participant],
-    best_of: int = 7,
-    first_player_distribution: float = 0.5,
-    shuffle: bool = True,
-    seed: int = 911,
-):
-    versus = make_initial_matches(players, shuffle, seed)
-    print("Initial Matches:", versus)
+# ==============================================================
+#           Torneo rápido (sin best-of, sin JSON)
+# ==============================================================
+
+def run_tournament(players, play_fn, shuffle=True, seed=0):
+    rng = np.random.default_rng(seed)
+
+    # primera ronda
+    versus = make_initial_matches(players, shuffle, rng)
 
     while True:
-        winners = play_round(
-            versus, play, best_of, first_player_distribution, seed
-        )
-        print("Winners this round:", winners)
+        winners = []
 
+        for a, b in versus:
+            # BYEs
+            if a is None:
+                winners.append(b)
+                continue
+            if b is None:
+                winners.append(a)
+                continue
+
+            # jugar 1 única partida
+            winner = play_fn(a, b, seed=seed)
+            winners.append(winner)
+
+        # si ya solo hay 1, terminó el torneo
+        winners = [w for w in winners if w is not None]
         if len(winners) == 1:
             return winners[0]
 
+        # emparejar para la siguiente ronda
         versus = pair_next_round(winners)
-        print("Next Matches:", versus)
