@@ -1,13 +1,13 @@
-# ============================================================
-#  TRAIN_MP.PY — MULTICORE TRAINING + PROMEDIO Q + LOGGING CSV
-# ============================================================
-
 import argparse
 import multiprocessing
 import numpy as np
 import os
 import csv
+import threading
 from collections import Counter
+
+# Agregar un lock global para asegurar acceso sincronizado a los Q-values
+_qvalues_lock = threading.Lock()
 
 multiprocessing.freeze_support()
 
@@ -104,6 +104,7 @@ def worker_train(args):
 
     # LOG LOCAL DEL WORKER
     local_logs = []
+    local_qvalues = {}  # Acumulador de Q-values por worker
 
     # entrenamiento aleatorio
     for _ in range(games_per_run):
@@ -137,16 +138,15 @@ def worker_train(args):
             "moves": moves
         })
 
+    # Acumular Q-values del worker
+    for name, p in players.items():
+        if hasattr(p, "Q"):
+            local_qvalues[name] = dict(p.Q)
+
     # torneo final del worker
     champion = knockout_tournament(players, rng)
 
-    # Q-values aprendidos
-    q_out = {}
-    for name, p in players.items():
-        if hasattr(p, "Q"):
-            q_out[name] = dict(p.Q)
-
-    return champion, q_out, local_logs
+    return champion, local_qvalues, local_logs
 
 
 # ------------------------------------------------------------
@@ -187,7 +187,7 @@ def save_merged_qvalues(final_q):
             p.Q = final_q[name]
             p._save_qvalues()
 
-    print("🔥 Q-values guardados correctamente.")
+    print("Q-values guardados correctamente.")
 
 
 # ------------------------------------------------------------
@@ -197,7 +197,7 @@ def run_training_parallel(runs, shuffle, seed, games_per_run):
     jobs = [(shuffle, seed + i, games_per_run, i) for i in range(runs)]
 
     ncpu = multiprocessing.cpu_count()
-    print(f"🧵 Usando {ncpu} núcleos para {runs} jobs…")
+    print(f"Usando {ncpu} núcleos para {runs} jobs…")
 
     champions = []
     all_q = []

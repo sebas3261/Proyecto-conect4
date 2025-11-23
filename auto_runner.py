@@ -14,8 +14,8 @@ sys.stdout.reconfigure(encoding='utf-8')
 BASE_CMD = [
     sys.executable,      # <-- Garantiza que use el Python del venv
     "train_mp.py",
-    "--runs", "50",
-    "--games-per-run", "200"
+    "--runs", "10",
+    "--games-per-run", "300"
 ]
 
 START_SEED = 911

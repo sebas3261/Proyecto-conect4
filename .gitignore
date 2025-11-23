@@ -17,7 +17,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# --- evitar carpetas de logs ---
-logs/
-*.log
+*.json
 
