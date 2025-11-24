@@ -16,6 +16,11 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
+**Windows git**
+```bash
+source venv/Scripts/activate
+```
+
 **Windows**
 ```bash
 venv\Scripts\Activate.ps1

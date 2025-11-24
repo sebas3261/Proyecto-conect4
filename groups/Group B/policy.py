@@ -3,151 +3,116 @@ import json
 import os
 import tempfile
 from connect4.policy import Policy
+from typing import override
 
 
 class UncertaintyWithEGreedy(Policy):
-    """
-    Policy B: e-greedy con Q-learning.
-    Versión arreglada: bootstrapping completo + guardado en cada paso.
-    """
 
     def __init__(self):
-        self.Q: dict[str, float] = {}
-        self.memory: list[tuple[str, int]] = []
-
-        # Hiperparámetros
-        self.epsilon: float = 0.01   # exploración mínima
-        self.alpha: float = 0.2
-        self.time_out = None
-
+        self.Q = {}
+        self.memory = []
+        self.epsilon = 0.01
+        self.alpha = 0.2
+        self.rng = np.random.default_rng()
         self._load_qvalues()
 
+    @override
     def mount(self, time_out=None):
-        self.time_out = max(1, int(time_out)) if time_out is not None else None
+        self.memory.clear()
 
-    # =========================================================
-    # ACT — e-greedy + bootstrapping completo + auto-save
-    # =========================================================
+    @override
     def act(self, s: np.ndarray) -> int:
-        s = s.copy()
-        self._normalize(s)
+        """Devuelve la acción que el agente tomará, según la política epsilon-greedy."""
 
-        state_key = self._state_key(s)
-        available_cols = [c for c in range(7) if s[0, c] == 0]
+        b_real = s.copy()  # Copia del tablero real (sin normalizar)
+        b = self._normalize(b_real)  # Normalización del tablero para el aprendizaje
 
-        if not available_cols:
-            return 0  # seguridad
+        # Acciones posibles (columnas disponibles)
+        available = np.flatnonzero(b_real[0] == 0)
+        if available.size == 0:
+            return -1  # Si no hay columnas disponibles, retornar -1
 
-        rng = np.random.default_rng()
+        state_key = b.tobytes().hex()  # Clave del estado en base al tablero normalizado
 
-        # 🔥 BOOTSTRAP Q(s,a) PARA TODAS LAS ACCIONES POSIBLES
-        for a in available_cols:
-            key = f"{state_key}|{a}"
+        # Inicializar Q-values para las nuevas acciones si no existen
+        for c in available:
+            key = f"{state_key}|{int(c)}"
             if key not in self.Q:
                 self.Q[key] = 0.0
 
-        # --- Epsilon-greedy ---
-        if rng.random() < self.epsilon:
-            action = int(rng.choice(available_cols))
+        # Selección de acción con epsilon-greedy
+        if self.rng.random() < self.epsilon:
+            action = int(self.rng.choice(available))  # Exploración: elige aleatoriamente una acción
         else:
-            action = self._exploit(state_key, available_cols)
+            # Explotación: elige la acción con el valor Q más alto
+            action = max(available, key=lambda c: self.Q[f"{state_key}|{c}"])
 
-        # Registrar transición
+        # Guardar el estado y la acción en memoria para actualizar después
         self.memory.append((state_key, action))
-
-        # 🔥 GUARDAR INMEDIATAMENTE (como UCB1)
-        self._save_qvalues()
-
         return action
 
-    # =========================================================
-    # EXPLOIT — elegir mejor acción según Q
-    # =========================================================
-    def _exploit(self, state_key: str, available_cols: list[int]) -> int:
-        best_q = -1e9
-        best_action = available_cols[0]
+    @override
+    def final(self, reward: int):
+        """Actualiza los Q-values según el premio recibido y limpia la memoria."""
 
-        for a in available_cols:
-            q = self.Q.get(f"{state_key}|{a}", 0.0)
-            if q > best_q:
-                best_q = q
-                best_action = a
+        for s_key, a in self.memory:
+            key = f"{s_key}|{a}"
+            q = self.Q.get(key, 0.0)
+            self.Q[key] = q + self.alpha * (reward - q)  # Fórmula de actualización de Q-value
 
-        return best_action
+        # Limpiar la memoria después de actualizar los Q-values
+        self.memory.clear()
 
-    # =========================================================
-    # FINAL — Q-learning + auto-save
-    # =========================================================
-    def final(self, reward: float):
-        if not self.memory:
-            return
+    # Utilidades para el manejo de archivos ------------
 
-        for state_key, action in self.memory:
-            key = f"{state_key}|{action}"
-            old_q = self.Q.get(key, 0.0)
-            new_q = old_q + self.alpha * (reward - old_q)
-            self.Q[key] = new_q
+    def _normalize(self, board: np.ndarray) -> np.ndarray:
+        """Normaliza el tablero para asegurarse de que el agente siempre juegue como el jugador 1."""
+        b = board.copy()
+        ones = np.count_nonzero(b == 1)
+        negs = np.count_nonzero(b == -1)
 
-        self.memory = []
-
-        # 🔥 GUARDAR SIEMPRE
-        self._save_qvalues()
-
-    # =========================================================
-    # NORMALIZACIÓN
-    # =========================================================
-    def _normalize(self, s):
-        ones = np.sum(s == 1)
-        negs = np.sum(s == -1)
-
-        if ones == negs:
-            return
-        if negs == ones + 1:
-            s[:] = -s
-            return
+        # Si hay más fichas -1, invertir todo el tablero para jugar como 1
         if negs > ones:
-            s[:] = -s
+            b = -b
 
-    # =========================================================
-    # KEYS
-    # =========================================================
-    def _state_key(self, s):
+        return b
+
+    def _state_key(self, s: np.ndarray) -> str:
+        """Convierte el tablero en una cadena única para usar como clave de estado."""
         return ",".join(map(str, s.reshape(-1)))
 
-    def _json_path(self):
+    def _json_path(self) -> str:
+        """Devuelve la ruta del archivo donde se guardarán los Q-values."""
         return os.path.join(os.path.dirname(__file__), "qvalues.json")
 
-    # =========================================================
-    # LOAD robusto
-    # =========================================================
     def _load_qvalues(self):
+        """Carga los Q-values desde el archivo json, si existe."""
         path = self._json_path()
         if not os.path.exists(path):
-            self.Q = {}
             return
-
         try:
             with open(path, "r") as f:
                 text = f.read().strip()
-
-            if not text:
-                self.Q = {}
-                return
-
-            self.Q = json.loads(text)
-        except Exception:
+                self.Q = json.loads(text) if text else {}
+        except Exception as e:
+            print(f"Error al cargar los Q-values: {e}")
             self.Q = {}
 
-    # =========================================================
-    # SAVE atómico — SIEMPRE GUARDA
-    # =========================================================
-    def _save_qvalues(self):
-        path = self._json_path()
-        dirpath = os.path.dirname(path)
-        os.makedirs(dirpath, exist_ok=True)
+    def _save_qvalues(self, path_override=None):
+        """Guarda los Q-values de forma segura en un archivo temporal y luego renombra."""
+        path = path_override or self._json_path()
+        tmp = path + ".tmp"
 
-        fd, tmp_path = tempfile.mkstemp(dir=dirpath)
-        with os.fdopen(fd, "w") as f:
-            json.dump(self.Q, f)
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self.Q, f)
 
-        os.replace(tmp_path, path)
+            # Intenta reemplazar el archivo original
+            os.replace(tmp, path)
+        except PermissionError:
+            print("Error de permisos, intentando de nuevo...")
+            if os.path.exists(path):
+                os.remove(path)
+            os.rename(tmp, path)
+        except Exception as e:
+            print(f"Error al guardar los Q-values: {e}")
